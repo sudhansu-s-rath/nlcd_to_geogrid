@@ -10,7 +10,7 @@ This script:
 5. Merges each tile with corresponding MODIS base landuse tiles.
 6. Outputs merged tiles in a WPS_GEOG dataset folder.
 
-Usage: python nlcd_to_geogrid.py --raw_nlcd <path_to_raw_nlcd_tif> --modis_dir <path_to_modis_tiles> --out_dir <output_dataset_dir>
+Usage: python nlcd_to_geogrid.py (--raw_nlcd <path_to_raw_nlcd_tif> | --nlcd_input <path_to_processed_nlcd_tif>) --modis_dir <path_to_modis_tiles> --out_dir <output_dataset_dir>
 """
 
 import argparse
@@ -57,7 +57,7 @@ def extract_urban(nlcd_path: Path, urban_out: Path) -> None:
 def reproject_to_4326(urban_path: Path, proj_out: Path) -> None:
     """Reproject urban GeoTIFF to EPSG:4326."""
     nlcd = rxr.open_rasterio(str(urban_path))
-    nlcd_proj = nlcd.rio.reproject("EPSG:4326")
+    nlcd_proj = nlcd.rio.reproject("EPSG:4326", resampling='nearest')
     nlcd_proj.rio.to_raster(str(proj_out))
     vals = np.unique(nlcd_proj.values)
     print(f"Reprojected to {proj_out}, unique values: {vals}")
@@ -78,6 +78,7 @@ def map_to_modis(proj_path: Path, modis_out: Path) -> None:
         with rasterio.open(modis_out, 'w', **profile) as dst:
             for ji, window in src.block_windows(1):
                 arr = src.read(1, window=window)
+                arr = np.round(arr).astype(np.int16)  # ensure categorical integrity
                 modis_arr = map_nlcd_to_modis(arr)
                 dst.write(modis_arr, 1, window=window)
                 if ji == (0, 0):
@@ -159,14 +160,23 @@ def main() -> None:
     else:
         raise ValueError("Provide either --raw_nlcd or --nlcd_input")
 
-    # Write index
-    write_index(out_dir, wordsize=1)  # uint8 for merged
+    # Extract year from nlcd_path
+    match = re.search(r'(\d{4})', nlcd_path.name)
+    if match:
+        year = match.group(1)
+    else:
+        year = "unknown"
 
-    # Copy all MODIS tiles to output directory
-    print(f"[INFO] Copying all MODIS base tiles to {out_dir}")
-    for modis_file in modis_dir.glob("*"):
-        if modis_file.is_file():
-            shutil.copy(modis_file, out_dir / modis_file.name)
+    # Set final output directory with year
+    final_out_dir = out_dir / f"merged_nlcd_modis_{year}"
+    final_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create temp directory for NLCD tiles with year
+    temp_nlcd_dir = out_dir / f"nlcd_tiles_{year}"
+    temp_nlcd_dir.mkdir(exist_ok=True)
+
+    # Write index
+    write_index(final_out_dir, wordsize=1)  # uint8 for merged
 
     # Read NLCD source
     with rasterio.open(nlcd_path) as src:
@@ -177,7 +187,7 @@ def main() -> None:
 
         print(f"[INFO] Input bounds: {src.bounds}")
         print(f"[INFO] Tiling rows {row_min}..{row_max}, cols {col_min}..{col_max} (MODIS-style 10° tiles)")
-        print(f"[INFO] Output folder: {out_dir}")
+        print(f"[INFO] Output folder: {final_out_dir}")
 
         tiles_written = 0
         tiles_skipped = 0
@@ -216,103 +226,55 @@ def main() -> None:
                 y_start = (row - 1) * TILE_Y + 1
                 y_end = row * TILE_Y
                 tile_name = f"{x_start:05d}-{x_end:05d}.{y_start:05d}-{y_end:05d}"
-                modis_tile = modis_dir / tile_name
-                out_tile = out_dir / tile_name
 
-                if not modis_tile.exists():
-                    print(f"[WARNING] No MODIS tile for {tile_name}, skipping")
-                    continue
+                # Save NLCD tile to temp directory
+                nlcd_tile_path = temp_nlcd_dir / tile_name
+                dst_to_write = np.flipud(dst).astype('>i2')  # big-endian int16
+                dst_to_write.tofile(nlcd_tile_path)
 
-                # Read MODIS base
-                m = read_modis_tile(modis_tile)
-
-                # Merge: overlay NLCD urban on MODIS
-                merged = m.copy().astype(np.uint8)
-                urban_mask = (dst == 31) | (dst == 32) | (dst == 33)
-                merged[urban_mask] = dst[urban_mask].astype(np.uint8)
-
-                # Write merged tile
-                merged.tofile(out_tile)
                 tiles_written += 1
 
-        print(f"[DONE] Tiles written: {tiles_written}")
+        print(f"[DONE] NLCD tiles written: {tiles_written}")
         print(f"[DONE] Tiles skipped (no urban): {tiles_skipped}")
-        print(f"[DONE] Index written: {out_dir / 'index'}")
+
+    # Now, copy all MODIS tiles to final_out_dir
+    print("[INFO] Copying all MODIS tiles to output directory...")
+    for modis_file in modis_dir.iterdir():
+        if modis_file.is_file() and modis_file.name != "index":
+            shutil.copy2(modis_file, final_out_dir / modis_file.name)
+    print(f"[DONE] All MODIS tiles copied to {final_out_dir}")
+
+    # Now, merge NLCD overlays
+    print("[INFO] Merging NLCD urban overlays...")
+    merges_done = 0
+    for nlcd_tile in temp_nlcd_dir.iterdir():
+        tile_name = nlcd_tile.name
+        out_tile = final_out_dir / tile_name
+
+        # Read NLCD tile (big-endian int16)
+        nlcd_arr = np.fromfile(nlcd_tile, dtype='>i2').reshape(1200, 1200)
+        # nlcd_arr = np.flipud(nlcd_arr)  # flip back (I changed)
+
+        # Read MODIS base from final_out_dir (already copied)
+        m = read_modis_tile(out_tile)
+
+        # Merge: overlay NLCD urban on MODIS
+        merged = m.copy()
+        urban_mask = (nlcd_arr == 31) | (nlcd_arr == 32) | (nlcd_arr == 33)
+        merged[urban_mask] = nlcd_arr[urban_mask].astype(np.uint8)
+
+        # Write merged tile back
+        merged.tofile(out_tile)
+        merges_done += 1
+
+    print(f"[DONE] Merges performed: {merges_done}")
+
+    # Do not remove temp
+    print(f"[INFO] NLCD tiles kept in {temp_nlcd_dir}")
 
     # Write index
-    write_index(out_dir, wordsize=1)  # uint8 for merged
-
-    # Read NLCD source
-    with rasterio.open(nlcd_path) as src:
-        if src.crs is None or src.crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
-            raise RuntimeError(f"Input must be EPSG:4326 (got {src.crs})")
-
-        row_min, row_max, col_min, col_max = rowcol_range_for_bounds(src.bounds)
-
-        print(f"[INFO] Input bounds: {src.bounds}")
-        print(f"[INFO] Tiling rows {row_min}..{row_max}, cols {col_min}..{col_max} (MODIS-style 10° tiles)")
-        print(f"[INFO] Output folder: {out_dir}")
-
-        tiles_written = 0
-        tiles_skipped = 0
-
-        # Loop through intersecting global tiles
-        for row in range(row_min, row_max + 1):
-            for col in range(col_min, col_max + 1):
-                west, south, east, north = tile_edges_from_rowcol(row, col)
-
-                # Build destination transform
-                dst_transform = Affine(DX, 0.0, west, 0.0, -DY, north)
-                dst = np.zeros((TILE_Y, TILE_X), dtype=np.int16)
-
-                # Reproject NLCD into tile grid
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=dst,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    src_nodata=0,
-                    dst_transform=dst_transform,
-                    dst_crs="EPSG:4326",
-                    dst_nodata=0,
-                    resampling=Resampling.nearest,
-                )
-
-                # Check if tile has urban pixels
-                has_urban = np.any((dst == 31) | (dst == 32) | (dst == 33))
-                if not has_urban:
-                    tiles_skipped += 1
-                    continue
-
-                # Tile name
-                x_start = (col - 1) * TILE_X + 1
-                x_end = col * TILE_X
-                y_start = (row - 1) * TILE_Y + 1
-                y_end = row * TILE_Y
-                tile_name = f"{x_start:05d}-{x_end:05d}.{y_start:05d}-{y_end:05d}"
-                modis_tile = modis_dir / tile_name
-                out_tile = out_dir / tile_name
-
-                if not modis_tile.exists():
-                    print(f"[WARNING] No MODIS tile for {tile_name}, skipping")
-                    continue
-
-                # Read MODIS base
-                m = read_modis_tile(modis_tile)
-
-                # Merge: overlay NLCD urban on MODIS
-                merged = m.copy().astype(np.uint8)
-                urban_mask = (dst == 31) | (dst == 32) | (dst == 33)
-                merged[urban_mask] = dst[urban_mask].astype(np.uint8)
-
-                # Write merged tile
-                merged.tofile(out_tile)
-                tiles_written += 1
-
-        print(f"[DONE] Tiles merged: {tiles_written}")
-        print(f"[DONE] Tiles skipped (no urban): {tiles_skipped}")
-        print(f"[DONE] All MODIS tiles copied to {out_dir}")
-        print(f"[DONE] Index written: {out_dir / 'index'}")
+    write_index(final_out_dir, wordsize=1)  # uint8 for merged
+    print(f"[DONE] Index written: {final_out_dir / 'index'}")
 
 if __name__ == "__main__":
     main()
