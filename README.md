@@ -24,6 +24,20 @@ Or with pre-processed NLCD:
 python nlcd_to_geogrid.py --nlcd_input <path_to_processed_nlcd_tif> --modis_dir <path_to_modis_tiles> --out_dir <output_dataset_dir>
 ```
 
+## Example (1985 NLCD)
+
+- Raw NLCD: `/data/mgeorge7/sudhansu_WORK/geo_em/nlcd_yearly_tif/Annual_NLCD_LndCov_1985_CU_C1V1.tif`
+- MODIS dir: `/data/mgeorge7/sudhansu_WORK/WPS_GEOG/modis_landuse_20class_30s_with_lakes`
+- Output dir (includes intermediates): `/data/mgeorge7/sudhansu_WORK/geo_em/nlcd_to_geogrid/test_output`
+
+Command:
+
+```bash
+python nlcd_to_geogrid.py --raw_nlcd /data/mgeorge7/sudhansu_WORK/geo_em/nlcd_yearly_tif/Annual_NLCD_LndCov_1985_CU_C1V1.tif --modis_dir /data/mgeorge7/sudhansu_WORK/WPS_GEOG/modis_landuse_20class_30s_with_lakes --out_dir /data/mgeorge7/sudhansu_WORK/geo_em/nlcd_to_geogrid/test_output
+```
+
+After the run, copy the needed WPS_GEOG tiles and `index` file from `test_output` into your WPS_GEOG directory (e.g., `/data/mgeorge7/sudhansu_WORK/WPS_GEOG/merged_nlcd_modis_1985`) and keep intermediates in `test_output` as needed.
+
 ## Requirements
 
 - Python 3.8+
