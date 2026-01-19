@@ -56,32 +56,3 @@ After the run, copy the needed WPS_GEOG tiles and `index` file from `test_output
 ## Author
 
 Sudhansu S. Rath
-
-If you want to use the gnu compiler edit the files:
-`semi_lag_3th_order_free.f` and `tmin_tmax.f` Dand do the following changes:
-
-look for the lines:
-
-``` Fortran
-   integer, parameter :: recl_f=1*nx*ny  ! for intel ifort
-!   integer, parameter :: recl_f=4*nx*ny  ! for gnu gfortran
-```
-
-and replace the with:
-
-``` Fortran
-!   integer, parameter :: recl_f=1*nx*ny  ! for intel ifort
-   integer, parameter :: recl_f=4*nx*ny  ! for gnu gfortran
-```
-
-To compile and execute `semi_lag_3th_order_free.f` use the commands:
-``` bash
-gfortran -ffree-form -o semi_lag semi_lag_3th_order_free.f
-./semi_lag
-```
-
-To compile and execute `tmin_tmax.f` use the commands:
-``` bash
-gfortran -ffree-form -o tmin_tmax tmin_tmax.f
-./tmin_tmax
-```
