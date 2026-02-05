@@ -2,15 +2,7 @@
 """
 NLCD to Geogrid: Create WPS_GEOG-compatible LANDUSEF tiles by overlaying NLCD urban data on MODIS landuse.
 
-This script:
-1. Extracts urban classes from raw NLCD GeoTIFF.
-2. Reprojects to EPSG:4326.
-3. Maps NLCD urban to MODIS codes.
-4. Tiles into WPS_GEOG format.
-5. Merges each tile with corresponding MODIS base landuse tiles.
-6. Outputs merged tiles in a WPS_GEOG dataset folder.
-
-Usage: python nlcd_to_geogrid.py (--raw_nlcd <path_to_raw_nlcd_tif> | --nlcd_input <path_to_processed_nlcd_tif>) --modis_dir <path_to_modis_tiles> --out_dir <output_dataset_dir>
+FINAL FIXED VERSION - Corrected endianness issue for urban fraction tiles.
 """
 
 import argparse
@@ -102,7 +94,7 @@ def rowcol_range_for_bounds(bounds: rasterio.coords.BoundingBox) -> tuple[int, i
 
 def write_index(out_dir: Path, wordsize: int = 2) -> None:
     idx = f"""type=categorical
-category_min=0
+category_min=1
 category_max=33
 missing_value=0
 projection=regular_ll
@@ -117,8 +109,31 @@ tile_x={TILE_X}
 tile_y={TILE_Y}
 tile_z=1
 units="category"
-description="MODIS landuse with NLCD urban overlay: 31/32/33 urban; 0-20/21-30 MODIS"
+description="MODIS landuse with NLCD urban overlay: 31/32/33 urban; 1-21 MODIS base"
 mminlu="MODIFIED_IGBP_MODIS_NOAH"
+"""
+    (out_dir / "index").write_text(idx)
+
+def write_index_urbfrac(out_dir: Path, wordsize: int = 1) -> None:
+    """
+    Write index file for urban fraction tiles.
+    Uses uint8 (0-100) with scale_factor=0.01 for reliable WPS/geogrid compatibility.
+    """
+    idx = f"""type=continuous
+projection=regular_ll
+dx={DX}
+dy={DY}
+known_x=1.0
+known_y=1.0
+known_lat={KNOWN_LAT}
+known_lon={KNOWN_LON}
+wordsize={wordsize}
+scale_factor=0.01
+tile_x={TILE_X}
+tile_y={TILE_Y}
+tile_z=1
+units="fraction"
+description="Urban fraction (0-1) from NLCD urban mask area-mean on MODIS 30s grid"
 """
     (out_dir / "index").write_text(idx)
 
@@ -157,8 +172,67 @@ def main() -> None:
         nlcd_path = modis_path
     elif args.nlcd_input:
         nlcd_path = Path(args.nlcd_input)
+        year = "input"
     else:
         raise ValueError("Provide either --raw_nlcd or --nlcd_input")
+
+    # Create urban mask (binary: 0.0 or 1.0)
+    urbmask_path = out_dir / f"intermediate_04_urbmask_{year}.tif"
+    print(f"[INFO] Creating urban mask from {nlcd_path}")
+    with rasterio.open(nlcd_path) as src:
+        profile = src.profile.copy()
+        # CRITICAL: Use float32 with no nodata value
+        profile.update(dtype=rasterio.float32, count=1, nodata=None)
+        with rasterio.open(urbmask_path, "w", **profile) as dst:
+            for ji, window in src.block_windows(1):
+                arr = src.read(1, window=window)
+                # Create binary mask: 1.0 for urban (31,32,33), 0.0 for everything else
+                mask = ((arr == 31) | (arr == 32) | (arr == 33)).astype(np.float32)
+                dst.write(mask, 1, window=window)
+    
+    # Verify the urban mask
+    print(f"[INFO] Verifying urban mask: {urbmask_path}")
+    with rasterio.open(urbmask_path) as check:
+        sample = check.read(1, window=rasterio.windows.Window(0, 0, min(1000, check.width), min(1000, check.height)))
+        unique_vals = np.unique(sample)
+        print(f"[DEBUG] Urbmask unique values: {unique_vals}")
+        print(f"[DEBUG] Urbmask nodata: {check.nodata}")
+        print(f"[DEBUG] Urbmask dtype: {check.dtypes[0]}")
+        print(f"[DEBUG] Urbmask resolution: {check.res}")
+        if check.nodata is not None:
+            print(f"[WARNING] Urbmask has nodata value {check.nodata} - this may cause issues!")
+        if not np.all(np.isin(unique_vals, [0.0, 1.0])):
+            print(f"[WARNING] Urbmask contains values other than 0.0 and 1.0: {unique_vals}")
+    
+    # ========================================================================
+    # OPTION 1: Enhance urbmask with MODIS category 13 (composite urban mask)
+    # This adds MODIS-detected urban (cat 13) where NLCD doesn't provide coverage
+    # Maps MODIS 13 -> treated as urban in urbfrac computation
+    # TOGGLE: Comment out the entire block below to disable this enhancement
+    # ========================================================================
+    print(f"[INFO] Enhancing urban mask with MODIS category 13 (where NLCD has no urban)...")
+    with rasterio.open(nlcd_path) as modis_src:
+        with rasterio.open(urbmask_path, 'r+') as urbmask_dst:
+            modis_13_count = 0
+            for ji, window in modis_src.block_windows(1):
+                # Read current urbmask (NLCD-derived)
+                urbmask_data = urbmask_dst.read(1, window=window).astype(np.float32)
+                
+                # Read MODIS/NLCD-mapped layer
+                modis_data = modis_src.read(1, window=window).astype(np.int16)
+                
+                # Find MODIS cat 13 pixels that don't already have NLCD urban
+                modis_13_mask = (modis_data == 13) & (urbmask_data == 0.0)
+                
+                # Set these to 1.0 (urban) in the urbmask
+                urbmask_data[modis_13_mask] = 1.0
+                modis_13_count += np.count_nonzero(modis_13_mask)
+                
+                # Write back
+                urbmask_dst.write(urbmask_data.astype(np.float32), 1, window=window)
+            
+            print(f"[INFO] Added {modis_13_count} MODIS cat 13 pixels to urbmask (treated as urban in urbfrac)")
+    # ========================================================================"
 
     # Extract year from nlcd_path
     match = re.search(r'(\d{4})', nlcd_path.name)
@@ -166,6 +240,11 @@ def main() -> None:
         year = match.group(1)
     else:
         year = "unknown"
+
+    # Set urbfrac output directory (GEOGRID.TBL expects urbfrac_nlcdYYYY)
+    urbfrac_out_dir = out_dir / f"urbfrac_nlcd{year}"
+    urbfrac_out_dir.mkdir(parents=True, exist_ok=True)
+    write_index_urbfrac(urbfrac_out_dir, wordsize=1)  # wordsize=1 for uint8 with scale_factor
 
     # Set final output directory with year
     final_out_dir = out_dir / f"merged_nlcd_modis_{year}"
@@ -237,7 +316,73 @@ def main() -> None:
         print(f"[DONE] NLCD tiles written: {tiles_written}")
         print(f"[DONE] Tiles skipped (no urban): {tiles_skipped}")
 
-    # Now, copy all MODIS tiles to final_out_dir
+    # Tile urban fraction
+    print(f"[INFO] Creating urban fraction tiles from {urbmask_path}")
+    with rasterio.open(urbmask_path) as srcu:
+        print(f"[DEBUG] Source for urban fraction:")
+        print(f"  Resolution: {srcu.res}")
+        print(f"  Shape: {srcu.shape}")
+        print(f"  NoData: {srcu.nodata}")
+        print(f"  Dtype: {srcu.dtypes[0]}")
+        
+        frac_tiles_written = 0
+        
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                west, south, east, north = tile_edges_from_rowcol(row, col)
+                dst_transform = Affine(DX, 0.0, west, 0.0, -DY, north)
+                dst_frac = np.zeros((TILE_Y, TILE_X), dtype=np.float32)
+
+                # Reproject with AVERAGE resampling to compute fractions
+                reproject(
+                    source=rasterio.band(srcu, 1),
+                    destination=dst_frac,
+                    src_transform=srcu.transform,
+                    src_crs=srcu.crs,
+                    src_nodata=None,  # No nodata in source
+                    dst_transform=dst_transform,
+                    dst_crs="EPSG:4326",
+                    dst_nodata=None,  # No nodata in destination
+                    resampling=Resampling.average,  # Average 0.0 and 1.0 values
+                )
+
+                # Validate range and clip if necessary
+                frac_min = dst_frac.min()
+                frac_max = dst_frac.max()
+                
+                if frac_max > 1.0 or frac_min < 0.0:
+                    print(f"[WARNING] Tile ({row},{col}): Invalid range [{frac_min:.6f}, {frac_max:.6f}] - clipping to [0, 1]")
+                    dst_frac = np.clip(dst_frac, 0.0, 1.0)
+
+                # Tile name
+                x_start = (col - 1) * TILE_X + 1
+                x_end = col * TILE_X
+                y_start = (row - 1) * TILE_Y + 1
+                y_end = row * TILE_Y
+                tile_name = f"{x_start:05d}-{x_end:05d}.{y_start:05d}-{y_end:05d}"
+
+                # CRITICAL: Convert fraction [0.0, 1.0] to uint8 [0, 100] for WPS compatibility
+                # WPS will apply scale_factor=0.01 to convert back to [0.0, 1.0]
+                frac_tile_path = urbfrac_out_dir / tile_name
+                dst_frac_scaled = (np.flipud(dst_frac) * 100.0).clip(0, 100).astype(np.uint8)
+                dst_frac_scaled.tofile(frac_tile_path)
+                
+                frac_tiles_written += 1
+                
+                # Debug output for first tile
+                if frac_tiles_written == 1:
+                    print(f"[DEBUG] First fraction tile ({row},{col}) statistics:")
+                    print(f"  Range: [{dst_frac.min():.6f}, {dst_frac.max():.6f}]")
+                    print(f"  Mean: {dst_frac.mean():.6f}")
+                    print(f"  Non-zero pixels: {np.count_nonzero(dst_frac)} ({100*np.count_nonzero(dst_frac)/(TILE_X*TILE_Y):.2f}%)")
+                    unique_vals = np.unique(dst_frac)
+                    print(f"  Unique values (first 20): {unique_vals[:20]}")
+                    print(f"  Total unique values: {len(unique_vals)}")
+                    if len(unique_vals) <= 10:
+                        print(f"  [WARNING] Only {len(unique_vals)} unique values - expected more for fractional data!")
+
+        print(f"[DONE] Urban fraction tiles written: {frac_tiles_written} to {urbfrac_out_dir}")
+    
     print("[INFO] Copying all MODIS tiles to output directory...")
     for modis_file in modis_dir.iterdir():
         if modis_file.is_file() and modis_file.name != "index":
@@ -253,7 +398,6 @@ def main() -> None:
 
         # Read NLCD tile (big-endian int16)
         nlcd_arr = np.fromfile(nlcd_tile, dtype='>i2').reshape(1200, 1200)
-        # nlcd_arr = np.flipud(nlcd_arr)  # flip back (I changed)
 
         # Read MODIS base from final_out_dir (already copied)
         m = read_modis_tile(out_tile)
@@ -262,6 +406,21 @@ def main() -> None:
         merged = m.copy()
         urban_mask = (nlcd_arr == 31) | (nlcd_arr == 32) | (nlcd_arr == 33)
         merged[urban_mask] = nlcd_arr[urban_mask].astype(np.uint8)
+        
+        # ====================================================================
+        # ENHANCED MERGE: Convert remaining MODIS cat 13 -> 32 (medium urban)
+        # This applies ONLY to MODIS pixels with cat 13 that don't overlap
+        # with NLCD urban coverage (where NLCD didn't provide urban classes).
+        # Category 32 = Medium-density urban (NLCD-style)
+        # TOGGLE: Comment out the block below to disable this conversion
+        # ====================================================================
+        remaining_cat13_mask = (m == 13) & ~urban_mask
+        merged[remaining_cat13_mask] = 32
+        if np.any(remaining_cat13_mask):
+            cat13_pixels = np.count_nonzero(remaining_cat13_mask)
+            # Uncomment line below for verbose per-tile logging:
+            # print(f"[DEBUG] Tile {tile_name}: Converted {cat13_pixels} MODIS cat 13 -> 32")
+        # ====================================================================
 
         # Write merged tile back
         merged.tofile(out_tile)
@@ -275,6 +434,18 @@ def main() -> None:
     # Write index
     write_index(final_out_dir, wordsize=1)  # uint8 for merged
     print(f"[DONE] Index written: {final_out_dir / 'index'}")
+    
+    print(f"\n{'='*70}")
+    print(f"PROCESSING COMPLETE")
+    print(f"{'='*70}")
+    print(f"Urban fraction tiles: {urbfrac_out_dir}")
+    print(f"Merged NLCD+MODIS tiles: {final_out_dir}")
+    print(f"\nIMPORTANT: Index file settings (following NLCD 2011 format):")
+    print(f"  - wordsize=1 (uint8)")
+    print(f"  - scale_factor=0.01")
+    print(f"  - Tiles store fractions as 0-100, WPS converts to 0.0-1.0")
+    print(f"\nTo verify urban fraction quality, run:")
+    print(f"  python diagnose_urban_fraction.py --urbfrac_dir {urbfrac_out_dir}")
 
 if __name__ == "__main__":
     main()
